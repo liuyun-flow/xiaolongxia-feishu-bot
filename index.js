@@ -1,4 +1,5 @@
 import "dotenv/config";
+import pg from "pg";
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -20,6 +21,7 @@ const {
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = "deepseek-v4-pro",
   TAVILY_API_KEY,
+  DATABASE_URL,
   PORT = "3000",
   MEMORY_FILE = "./memory.json",
   SCHEDULE_INTERVAL_MS = String(24 * 60 * 60 * 1000),
@@ -30,6 +32,7 @@ console.log("FEISHU_APP_ID 存在：", Boolean(FEISHU_APP_ID));
 console.log("FEISHU_APP_SECRET 存在：", Boolean(FEISHU_APP_SECRET));
 console.log("DEEPSEEK_API_KEY 存在：", Boolean(DEEPSEEK_API_KEY));
 console.log("TAVILY_API_KEY 存在：", Boolean(TAVILY_API_KEY));
+console.log("DATABASE_URL 存在：", Boolean(DATABASE_URL));
 console.log("DEEPSEEK_MODEL：", DEEPSEEK_MODEL);
 console.log("MEMORY_FILE：", MEMORY_FILE);
 
@@ -134,7 +137,94 @@ class JsonMemoryStore {
   }
 }
 
-const MEMORY = new JsonMemoryStore(MEMORY_FILE);
+class PostgresMemoryStore {
+  constructor(databaseUrl) {
+    const { Pool } = pg;
+    this.pool = new Pool({
+      connectionString: databaseUrl,
+      // Railway 的内部 DATABASE_URL 通常不需要 SSL。
+      // 如果你使用外部 Postgres 且要求 SSL，可设置 PGSSLMODE=require。
+      ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
+    });
+    this.ready = false;
+  }
+
+  async init() {
+    if (this.ready) return;
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS memory_store (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_memory_store_expires_at
+      ON memory_store (expires_at);
+    `);
+
+    this.ready = true;
+    await this.cleanupExpired();
+
+    console.log("PostgreSQL memory store is ready.");
+  }
+
+  async cleanupExpired() {
+    await this.pool.query(
+      `DELETE FROM memory_store WHERE expires_at IS NOT NULL AND expires_at <= NOW();`
+    );
+  }
+
+  async get(key) {
+    await this.init();
+
+    const res = await this.pool.query(
+      `SELECT value FROM memory_store
+       WHERE key = $1
+       AND (expires_at IS NULL OR expires_at > NOW())
+       LIMIT 1;`,
+      [key]
+    );
+
+    return res.rows[0]?.value ?? null;
+  }
+
+  async put(key, value, options = {}) {
+    await this.init();
+
+    const ttl = Number(options.expirationTtl || 0);
+    const expiresAt = ttl > 0 ? new Date(Date.now() + ttl * 1000) : null;
+
+    await this.pool.query(
+      `INSERT INTO memory_store (key, value, expires_at, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET
+         value = EXCLUDED.value,
+         expires_at = EXCLUDED.expires_at,
+         updated_at = NOW();`,
+      [key, String(value), expiresAt]
+    );
+  }
+
+  async delete(key) {
+    await this.init();
+
+    await this.pool.query(
+      `DELETE FROM memory_store WHERE key = $1;`,
+      [key]
+    );
+  }
+}
+
+const MEMORY = DATABASE_URL
+  ? new PostgresMemoryStore(DATABASE_URL)
+  : new JsonMemoryStore(MEMORY_FILE);
+
+console.log(DATABASE_URL ? "记忆存储：PostgreSQL" : "记忆存储：memory.json 文件");
 
 const baseConfig = {
   appId: FEISHU_APP_ID,

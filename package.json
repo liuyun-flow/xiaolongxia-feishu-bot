@@ -1,7 +1,7 @@
 {
   "name": "xiaolongxia-feishu-railway",
   "version": "1.0.0",
-  "description": "Xiaolongxia AI bot migrated from Cloudflare Worker to Railway Node.js + Feishu SDK long connection.",
+  "description": "Xiaolongxia AI bot with Railway Node.js + Feishu SDK long connection + PostgreSQL memory.",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.24.0",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">=20"
