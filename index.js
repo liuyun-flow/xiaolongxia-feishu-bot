@@ -1,92 +1,180 @@
-export default {
-  async fetch(request, env, ctx) {
-    if (request.method === "GET") {
-      return new Response("Xiaolongxia Agent Bot is running.", {
-        status: 200,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-        },
-      });
-    }
+import "dotenv/config";
+import http from "node:http";
+import fs from "node:fs/promises";
+import path from "node:path";
+import * as Lark from "@larksuiteoapi/node-sdk";
 
-    if (request.method !== "POST") {
-      return Response.json({
-        ok: false,
-        message: "Only GET and POST are supported.",
-      });
-    }
+/**
+ * Xiaolongxia AI - Railway Node.js + Feishu Official SDK Long Connection
+ *
+ * 迁移说明：
+ * - 原 Cloudflare Worker 的 fetch/event/scheduled 框架已替换为 Node.js 常驻进程。
+ * - 飞书入口改为官方 SDK WSClient 长连接。
+ * - 原 env.MEMORY KV 改为本地 JSON 文件存储，保留 get/put/delete + expirationTtl 接口。
+ * - 原命令、DeepSeek、Tavily、Skill、复盘逻辑尽量保持不变。
+ */
 
-    let body = {};
+const {
+  FEISHU_APP_ID,
+  FEISHU_APP_SECRET,
+  DEEPSEEK_API_KEY,
+  DEEPSEEK_MODEL = "deepseek-v4-pro",
+  TAVILY_API_KEY,
+  PORT = "3000",
+  MEMORY_FILE = "./memory.json",
+  SCHEDULE_INTERVAL_MS = String(24 * 60 * 60 * 1000),
+} = process.env;
+
+console.log("========== 小龙虾 AI 启动 ==========");
+console.log("FEISHU_APP_ID 存在：", Boolean(FEISHU_APP_ID));
+console.log("FEISHU_APP_SECRET 存在：", Boolean(FEISHU_APP_SECRET));
+console.log("DEEPSEEK_API_KEY 存在：", Boolean(DEEPSEEK_API_KEY));
+console.log("TAVILY_API_KEY 存在：", Boolean(TAVILY_API_KEY));
+console.log("DEEPSEEK_MODEL：", DEEPSEEK_MODEL);
+console.log("MEMORY_FILE：", MEMORY_FILE);
+
+if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
+  console.error("启动失败：缺少 FEISHU_APP_ID 或 FEISHU_APP_SECRET");
+  process.exit(1);
+}
+
+if (!DEEPSEEK_API_KEY) {
+  console.warn("警告：未配置 DEEPSEEK_API_KEY。飞书长连接可启动，但正常聊天会失败。");
+}
+
+// Railway 健康检查服务：让 Railway 知道服务还活着
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Xiaolongxia Feishu Long Connection Bot is running.");
+  })
+  .listen(Number(PORT), () => {
+    console.log(`Health server listening on port ${PORT}`);
+  });
+
+// 用 JSON 文件模拟 Cloudflare KV，保留 put/get/delete 和 expirationTtl 语义
+class JsonMemoryStore {
+  constructor(filePath) {
+    this.filePath = path.resolve(filePath);
+    this.data = {};
+    this.loaded = false;
+    this.writeTimer = null;
+  }
+
+  async load() {
+    if (this.loaded) return;
 
     try {
-      const bodyText = await request.text();
+      const raw = await fs.readFile(this.filePath, "utf8");
+      this.data = JSON.parse(raw || "{}");
+    } catch {
+      this.data = {};
+    }
 
-      if (!bodyText) {
-        return Response.json({
-          ok: true,
-          message: "POST received, but body is empty.",
-        });
+    this.loaded = true;
+    this.cleanupExpired();
+  }
+
+  cleanupExpired() {
+    const now = Date.now();
+
+    for (const [key, item] of Object.entries(this.data)) {
+      if (item && item.expiresAt && item.expiresAt <= now) {
+        delete this.data[key];
       }
+    }
+  }
 
-      body = JSON.parse(bodyText);
-    } catch (e) {
-      return Response.json({
-        ok: false,
-        message: "POST received, but body is not valid JSON.",
-        error: String(e),
-      });
+  async persistSoon() {
+    clearTimeout(this.writeTimer);
+    this.writeTimer = setTimeout(async () => {
+      try {
+        await fs.writeFile(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
+      } catch (error) {
+        console.error("Memory persist failed:", error);
+      }
+    }, 200);
+  }
+
+  async get(key) {
+    await this.load();
+    this.cleanupExpired();
+
+    const item = this.data[key];
+    if (!item) return null;
+
+    if (item.expiresAt && item.expiresAt <= Date.now()) {
+      delete this.data[key];
+      await this.persistSoon();
+      return null;
     }
 
-    // 飞书 URL 验证
-    if (body.type === "url_verification" && body.challenge) {
-      return Response.json({
-        challenge: body.challenge,
-      });
-    }
+    return item.value ?? null;
+  }
 
-    if (body.challenge) {
-      return Response.json({
-        challenge: body.challenge,
-      });
-    }
+  async put(key, value, options = {}) {
+    await this.load();
 
-    ctx.waitUntil(handleFeishuEvent(body, env));
+    const ttl = Number(options.expirationTtl || 0);
+    const expiresAt = ttl > 0 ? Date.now() + ttl * 1000 : null;
 
-    return Response.json({
-      ok: true,
-      message: "Event received.",
-    });
-  },
+    this.data[key] = {
+      value: String(value),
+      expiresAt,
+      updatedAt: new Date().toISOString(),
+    };
 
-  async scheduled(controller, env, ctx) {
-    ctx.waitUntil(runScheduledReview(env));
-  },
+    await this.persistSoon();
+  }
+
+  async delete(key) {
+    await this.load();
+    delete this.data[key];
+    await this.persistSoon();
+  }
+}
+
+const MEMORY = new JsonMemoryStore(MEMORY_FILE);
+
+const baseConfig = {
+  appId: FEISHU_APP_ID,
+  appSecret: FEISHU_APP_SECRET,
 };
 
-async function handleFeishuEvent(body, env) {
+const feishuClient = new Lark.Client(baseConfig);
+
+const eventDispatcher = new Lark.EventDispatcher({}).register({
+  "im.message.receive_v1": async (data) => {
+    await handleFeishuMessage(data);
+  },
+});
+
+const wsClient = new Lark.WSClient({
+  ...baseConfig,
+  loggerLevel: Lark.LoggerLevel.debug,
+});
+
+console.log("正在使用官方 SDK 启动飞书长连接客户端 WSClient...");
+wsClient.start({ eventDispatcher });
+console.log("wsClient.start 已执行。现在可以去飞书后台验证长连接。");
+
+// Node 常驻进程版“定时复盘”
+// 原 Cloudflare scheduled 改为 setInterval。
+const scheduleInterval = Number(SCHEDULE_INTERVAL_MS);
+if (scheduleInterval > 0) {
+  setInterval(() => {
+    runScheduledReview().catch((error) => {
+      console.error("Scheduled review failed:", error);
+    });
+  }, scheduleInterval);
+
+  console.log(`定时复盘已启用，间隔 ${scheduleInterval}ms`);
+}
+
+async function handleFeishuMessage(data) {
   try {
-    const header = body.header || {};
-    const event = body.event || {};
-
-    if (header.event_type !== "im.message.receive_v1") {
-      return;
-    }
-
-    // 防重复，避免飞书重试造成重复回复
-    const eventId = header.event_id;
-    if (eventId) {
-      const eventKey = `event:${eventId}`;
-      const existed = await env.MEMORY.get(eventKey);
-      if (existed) return;
-      await env.MEMORY.put(eventKey, "1", { expirationTtl: 600 });
-    }
-
-    const sender = event.sender || {};
-    const message = event.message || {};
-
-    if (sender.sender_type && sender.sender_type !== "user") {
-      return;
-    }
+    const message = data.message || {};
+    const sender = data.sender || {};
 
     const chatId = message.chat_id;
     const messageType = message.message_type;
@@ -99,7 +187,7 @@ async function handleFeishuEvent(body, env) {
     if (!chatId) return;
 
     if (messageType !== "text") {
-      await sendFeishuText(env, chatId, "我现在先支持文字。图片、文件、飞书文档读取可以后面再加。");
+      await sendFeishuText(chatId, "我现在先支持文字。图片、文件、飞书文档读取可以后面再加。");
       return;
     }
 
@@ -107,7 +195,7 @@ async function handleFeishuEvent(body, env) {
     try {
       const content = JSON.parse(message.content || "{}");
       userText = content.text || "";
-    } catch (e) {
+    } catch {
       userText = message.content || "";
     }
 
@@ -115,91 +203,93 @@ async function handleFeishuEvent(body, env) {
 
     if (!userText.trim()) return;
 
-    // 命令入口
+    console.log(`收到消息 chat=${chatId} user=${userId}:`, userText);
+
+    // 命令入口：保留原逻辑
     if (userText === "/帮助") {
-      await sendFeishuText(env, chatId, helpText());
+      await sendFeishuText(chatId, helpText());
       return;
     }
 
     if (userText === "/绑定主人") {
-      await env.MEMORY.put("admin:chat_id", chatId);
-      await sendFeishuText(env, chatId, "已绑定。以后定时复盘会发到这个会话。");
+      await MEMORY.put("admin:chat_id", chatId);
+      await sendFeishuText(chatId, "已绑定。以后定时复盘会发到这个会话。");
       return;
     }
 
     if (userText === "/忘记") {
-      await env.MEMORY.delete(memoryKey(chatId, userId));
-      await sendFeishuText(env, chatId, "已清空当前会话的短期上下文。长期偏好和 Skill 不会删除。");
+      await MEMORY.delete(memoryKey(chatId, userId));
+      await sendFeishuText(chatId, "已清空当前会话的短期上下文。长期偏好和 Skill 不会删除。");
       return;
     }
 
     if (userText === "/技能") {
-      const skills = await listSkills(env);
-      await sendFeishuText(env, chatId, skills);
+      const skills = await listSkills();
+      await sendFeishuText(chatId, skills);
       return;
     }
 
     if (userText.startsWith("/搜索 ")) {
       const query = userText.replace("/搜索 ", "").trim();
-      await sendFeishuText(env, chatId, "我去网上查一下。");
-      const searchContext = await webSearch(env, query, { force: true });
-      const answer = await answerWithSearch(env, query, searchContext);
-      await sendFeishuText(env, chatId, answer);
+      await sendFeishuText(chatId, "我去网上查一下。");
+      const searchContext = await webSearch(query, { force: true });
+      const answer = await answerWithSearch(query, searchContext);
+      await sendFeishuText(chatId, answer);
       return;
     }
 
     if (userText.startsWith("/爬取 ")) {
       const url = userText.replace("/爬取 ", "").trim();
-      await sendFeishuText(env, chatId, "我尝试读取这个网页。");
+      await sendFeishuText(chatId, "我尝试读取这个网页。");
       const page = await fetchPageText(url);
-      const summary = await summarizePage(env, url, page);
-      await sendFeishuText(env, chatId, summary);
+      const summary = await summarizePage(url, page);
+      await sendFeishuText(chatId, summary);
       return;
     }
 
     if (userText.startsWith("/沉淀skill ")) {
       const raw = userText.replace("/沉淀skill ", "").trim();
-      await sendFeishuText(env, chatId, "我会把这段经验整理成一个 Skill。");
-      const saved = await createSkillFromText(env, raw, userId);
-      await sendFeishuText(env, chatId, saved);
+      await sendFeishuText(chatId, "我会把这段经验整理成一个 Skill。");
+      const saved = await createSkillFromText(raw, userId);
+      await sendFeishuText(chatId, saved);
       return;
     }
 
     if (userText === "/复盘") {
-      await sendFeishuText(env, chatId, "我开始复盘最近对话，并更新长期偏好/Skill。");
-      const result = await reflectAndLearn(env, chatId, userId, { manual: true });
-      await sendFeishuText(env, chatId, result);
+      await sendFeishuText(chatId, "我开始复盘最近对话，并更新长期偏好/Skill。");
+      const result = await reflectAndLearn(chatId, userId, { manual: true });
+      await sendFeishuText(chatId, result);
       return;
     }
 
     // 正常聊天
-    await handleNormalChat(env, chatId, userId, userText);
+    await handleNormalChat(chatId, userId, userText);
   } catch (err) {
-    console.error("handleFeishuEvent error:", err);
+    console.error("handleFeishuMessage error:", err);
   }
 }
 
-async function handleNormalChat(env, chatId, userId, userText) {
+async function handleNormalChat(chatId, userId, userText) {
   const mKey = memoryKey(chatId, userId);
   const profileKey = `profile:${userId}`;
 
-  const history = await getJson(env, mKey, []);
-  const profile = await env.MEMORY.get(profileKey) || "";
-  const skills = await getRelevantSkills(env, userText);
+  const history = await getJson(mKey, []);
+  const profile = await MEMORY.get(profileKey) || "";
+  const skills = await getRelevantSkills(userText);
 
   const needWeb = shouldUseWeb(userText);
   let webContext = "";
 
   if (needWeb) {
-    await sendFeishuText(env, chatId, "这个问题可能需要最新信息，我先查一下。");
-    webContext = await webSearch(env, userText, { force: false });
+    await sendFeishuText(chatId, "这个问题可能需要最新信息，我先查一下。");
+    webContext = await webSearch(userText, { force: false });
   } else {
-    await sendFeishuText(env, chatId, "收到，我想一下。");
+    await sendFeishuText(chatId, "收到，我想一下。");
   }
 
   const recentHistory = history.slice(-24);
 
-  const reply = await callDeepSeek(env, [
+  const reply = await callDeepSeek([
     {
       role: "system",
       content: buildSystemPrompt(profile, skills, webContext),
@@ -211,27 +301,27 @@ async function handleNormalChat(env, chatId, userId, userText) {
     },
   ], {
     thinking: "disabled",
-    maxTokens: 220000000,
+    maxTokens: 2200,
   });
 
-  await sendFeishuText(env, chatId, reply);
+  await sendFeishuText(chatId, reply);
 
   recentHistory.push({ role: "user", content: userText });
   recentHistory.push({ role: "assistant", content: reply });
 
-  await env.MEMORY.put(mKey, JSON.stringify(recentHistory.slice(-24)), {
+  await MEMORY.put(mKey, JSON.stringify(recentHistory.slice(-24)), {
     expirationTtl: 60 * 60 * 24 * 30,
   });
 
   // 对话计数：每 6 轮自动小复盘一次，后台做，不打扰用户
   const countKey = `turn_count:${chatId}:${userId}`;
-  const count = Number(await env.MEMORY.get(countKey) || "0") + 1;
-  await env.MEMORY.put(countKey, String(count), {
+  const count = Number(await MEMORY.get(countKey) || "0") + 1;
+  await MEMORY.put(countKey, String(count), {
     expirationTtl: 60 * 60 * 24 * 30,
   });
 
   if (count % 6 === 0) {
-    await reflectAndLearn(env, chatId, userId, { manual: false });
+    await reflectAndLearn(chatId, userId, { manual: false });
   }
 }
 
@@ -303,14 +393,14 @@ function shouldUseWeb(text) {
   return keywords.some(k => t.includes(k));
 }
 
-async function webSearch(env, query, options = {}) {
-  if (!env.TAVILY_API_KEY) {
+async function webSearch(query, options = {}) {
+  if (!TAVILY_API_KEY) {
     return "未配置 TAVILY_API_KEY，无法联网搜索。";
   }
 
   const cacheKey = `search_cache:${simpleHash(query)}`;
   if (!options.force) {
-    const cached = await env.MEMORY.get(cacheKey);
+    const cached = await MEMORY.get(cacheKey);
     if (cached) return cached;
   }
 
@@ -319,7 +409,7 @@ async function webSearch(env, query, options = {}) {
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${env.TAVILY_API_KEY}`,
+      "Authorization": `Bearer ${TAVILY_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -355,15 +445,15 @@ async function webSearch(env, query, options = {}) {
 
   const result = parts.join("\n\n").slice(0, 8000);
 
-  await env.MEMORY.put(cacheKey, result, {
+  await MEMORY.put(cacheKey, result, {
     expirationTtl: 60 * 60 * 12,
   });
 
   return result;
 }
 
-async function answerWithSearch(env, query, searchContext) {
-  return await callDeepSeek(env, [
+async function answerWithSearch(query, searchContext) {
+  return await callDeepSeek([
     {
       role: "system",
       content: `你是中文研究助手。请只基于给定搜索资料回答。不要编造。回答要有结论、要点、风险。`,
@@ -379,7 +469,7 @@ ${searchContext}
     },
   ], {
     thinking: "disabled",
-    maxTokens: 220000000,
+    maxTokens: 2200,
   });
 }
 
@@ -419,8 +509,8 @@ async function fetchPageText(url) {
   }
 }
 
-async function summarizePage(env, url, pageText) {
-  return await callDeepSeek(env, [
+async function summarizePage(url, pageText) {
+  return await callDeepSeek([
     {
       role: "system",
       content: "你是网页资料整理助手。请总结网页核心内容，提炼可行动信息。不要编造网页中没有的内容。",
@@ -440,22 +530,22 @@ ${pageText}
     },
   ], {
     thinking: "disabled",
-    maxTokens: 180000000,
+    maxTokens: 1800,
   });
 }
 
-async function reflectAndLearn(env, chatId, userId, options = {}) {
+async function reflectAndLearn(chatId, userId, options = {}) {
   const mKey = memoryKey(chatId, userId);
   const profileKey = `profile:${userId}`;
 
-  const history = await getJson(env, mKey, []);
-  const oldProfile = await env.MEMORY.get(profileKey) || "";
+  const history = await getJson(mKey, []);
+  const oldProfile = await MEMORY.get(profileKey) || "";
 
   if (!history.length) {
     return "当前没有足够对话可以复盘。";
   }
 
-  const jsonText = await callDeepSeek(env, [
+  const jsonText = await callDeepSeek([
     {
       role: "system",
       content: `你是“小龙虾AI”的复盘与学习模块。
@@ -490,7 +580,7 @@ ${JSON.stringify(history.slice(-24), null, 2)}
   ], {
     thinking: "disabled",
     json: true,
-    maxTokens: 250000000,
+    maxTokens: 2500,
   });
 
   const data = safeJsonParse(jsonText);
@@ -500,7 +590,7 @@ ${JSON.stringify(history.slice(-24), null, 2)}
   }
 
   if (data.updated_profile) {
-    await env.MEMORY.put(profileKey, String(data.updated_profile).slice(0, 6000));
+    await MEMORY.put(profileKey, String(data.updated_profile).slice(0, 6000));
   }
 
   let savedSkillCount = 0;
@@ -508,7 +598,7 @@ ${JSON.stringify(history.slice(-24), null, 2)}
   if (Array.isArray(data.new_skills)) {
     for (const skill of data.new_skills) {
       if (Number(skill.confidence || 0) >= 0.72 && skill.name && skill.instruction) {
-        await saveSkill(env, {
+        await saveSkill({
           name: skill.name,
           trigger: skill.trigger || "",
           instruction: skill.instruction,
@@ -534,15 +624,15 @@ ${JSON.stringify(history.slice(-24), null, 2)}
     return report;
   }
 
-  await env.MEMORY.put(`last_auto_review:${chatId}:${userId}`, report, {
+  await MEMORY.put(`last_auto_review:${chatId}:${userId}`, report, {
     expirationTtl: 60 * 60 * 24 * 30,
   });
 
   return report;
 }
 
-async function createSkillFromText(env, raw, userId) {
-  const jsonText = await callDeepSeek(env, [
+async function createSkillFromText(raw, userId) {
+  const jsonText = await callDeepSeek([
     {
       role: "system",
       content: `你是 Skill 设计器。
@@ -573,7 +663,7 @@ JSON 格式：
     return "沉淀失败：没有整理出有效 Skill。";
   }
 
-  const saved = await saveSkill(env, {
+  const saved = await saveSkill({
     name: data.name,
     trigger: data.trigger || "",
     instruction: data.instruction,
@@ -591,7 +681,7 @@ ${saved.trigger}
 ${saved.instruction}`;
 }
 
-async function saveSkill(env, skill) {
+async function saveSkill(skill) {
   const id = `skill_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 
   const full = {
@@ -606,9 +696,9 @@ async function saveSkill(env, skill) {
     usageCount: 0,
   };
 
-  await env.MEMORY.put(`skill:${id}`, JSON.stringify(full));
+  await MEMORY.put(`skill:${id}`, JSON.stringify(full));
 
-  const index = await getJson(env, "skills:index", []);
+  const index = await getJson("skills:index", []);
 
   index.unshift({
     id,
@@ -618,13 +708,13 @@ async function saveSkill(env, skill) {
     usageCount: 0,
   });
 
-  await env.MEMORY.put("skills:index", JSON.stringify(index.slice(0, 80)));
+  await MEMORY.put("skills:index", JSON.stringify(index.slice(0, 80)));
 
   return full;
 }
 
-async function listSkills(env) {
-  const index = await getJson(env, "skills:index", []);
+async function listSkills() {
+  const index = await getJson("skills:index", []);
 
   if (!index.length) {
     return "当前还没有沉淀 Skill。你可以发送：/沉淀skill 你的经验内容";
@@ -639,8 +729,8 @@ async function listSkills(env) {
   ].join("\n\n");
 }
 
-async function getRelevantSkills(env, userText) {
-  const index = await getJson(env, "skills:index", []);
+async function getRelevantSkills(userText) {
+  const index = await getJson("skills:index", []);
 
   if (!index.length) return "";
 
@@ -659,7 +749,7 @@ async function getRelevantSkills(env, userText) {
   const skills = [];
 
   for (const item of matched) {
-    const full = await getJson(env, `skill:${item.id}`, null);
+    const full = await getJson(`skill:${item.id}`, null);
     if (full) {
       skills.push(`Skill：${full.name}
 触发：${full.trigger}
@@ -680,16 +770,16 @@ function overlapScore(a, b) {
   return score;
 }
 
-async function runScheduledReview(env) {
-  const adminChatId = await env.MEMORY.get("admin:chat_id");
+async function runScheduledReview() {
+  const adminChatId = await MEMORY.get("admin:chat_id");
 
   if (!adminChatId) {
     console.log("No admin chat bound. Use /绑定主人 first.");
     return;
   }
 
-  const skills = await getJson(env, "skills:index", []);
-  const report = await callDeepSeek(env, [
+  const skills = await getJson("skills:index", []);
+  const report = await callDeepSeek([
     {
       role: "system",
       content: "你是小龙虾AI的定时复盘模块。请根据已有 Skill 概况输出简短周报，指出下一步优化方向。",
@@ -707,22 +797,22 @@ ${JSON.stringify(skills.slice(0, 50), null, 2)}
     },
   ], {
     thinking: "disabled",
-    maxTokens: 180000000,
+    maxTokens: 1800,
   });
 
-  await sendFeishuText(env, adminChatId, `小龙虾AI定时复盘：\n\n${report}`);
+  await sendFeishuText(adminChatId, `小龙虾AI定时复盘：\n\n${report}`);
 }
 
-async function callDeepSeek(env, messages, options = {}) {
+async function callDeepSeek(messages, options = {}) {
   const body = {
-    model: env.DEEPSEEK_MODEL || "deepseek-v4-pro",
+    model: DEEPSEEK_MODEL || "deepseek-v4-pro",
     messages,
     thinking: {
       type: options.thinking === "enabled" ? "enabled" : "disabled",
     },
     stream: false,
     temperature: options.temperature ?? 0.9,
-    max_tokens: options.maxTokens || 200000000,
+    max_tokens: options.maxTokens || 2000,
   };
 
   if (options.thinking === "enabled") {
@@ -737,7 +827,7 @@ async function callDeepSeek(env, messages, options = {}) {
   const response = await fetch("https://api.deepseek.com/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${env.DEEPSEEK_API_KEY}`,
+      "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -752,7 +842,7 @@ async function callDeepSeek(env, messages, options = {}) {
 1. DEEPSEEK_API_KEY 是否正确
 2. DEEPSEEK_MODEL 是否可用
 3. 账户余额是否充足
-4. Worker 环境变量是否保存并重新部署`;
+4. Railway 环境变量是否保存并重新部署`;
   }
 
   const data = await response.json();
@@ -765,69 +855,25 @@ async function callDeepSeek(env, messages, options = {}) {
   return data.choices?.[0]?.message?.content?.trim() || "DeepSeek 返回为空。";
 }
 
-async function getTenantAccessToken(env) {
-  const cached = await env.MEMORY.get("feishu:tenant_access_token");
-
-  if (cached) return cached;
-
-  const response = await fetch(
-    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        app_id: env.FEISHU_APP_ID,
-        app_secret: env.FEISHU_APP_SECRET,
-      }),
-    }
-  );
-
-  const data = await response.json();
-
-  if (data.code !== 0) {
-    console.error("Feishu token error:", data);
-    throw new Error("Failed to get tenant_access_token");
-  }
-
-  const token = data.tenant_access_token;
-
-  await env.MEMORY.put("feishu:tenant_access_token", token, {
-    expirationTtl: 60 * 100,
-  });
-
-  return token;
-}
-
-async function sendFeishuText(env, chatId, text) {
-  const token = await getTenantAccessToken(env);
-
+async function sendFeishuText(chatId, text) {
   const chunks = splitText(String(text || ""), 2800);
 
   for (const chunk of chunks) {
-    const response = await fetch(
-      "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json",
+    try {
+      await feishuClient.im.v1.message.create({
+        params: {
+          receive_id_type: "chat_id",
         },
-        body: JSON.stringify({
+        data: {
           receive_id: chatId,
           msg_type: "text",
           content: JSON.stringify({
             text: chunk,
           }),
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (data.code !== 0) {
-      console.error("Feishu send message error:", data);
+        },
+      });
+    } catch (error) {
+      console.error("Feishu send message error:", error);
     }
   }
 }
@@ -857,14 +903,14 @@ function memoryKey(chatId, userId) {
   return `memory:${chatId}:${userId}`;
 }
 
-async function getJson(env, key, fallback) {
-  const raw = await env.MEMORY.get(key);
+async function getJson(key, fallback) {
+  const raw = await MEMORY.get(key);
 
   if (!raw) return fallback;
 
   try {
     return JSON.parse(raw);
-  } catch (e) {
+  } catch {
     return fallback;
   }
 }
@@ -872,13 +918,13 @@ async function getJson(env, key, fallback) {
 function safeJsonParse(text) {
   try {
     return JSON.parse(text);
-  } catch (e) {
+  } catch {
     const match = String(text).match(/\{[\s\S]*\}/);
     if (!match) return null;
 
     try {
       return JSON.parse(match[0]);
-    } catch (e2) {
+    } catch {
       return null;
     }
   }
