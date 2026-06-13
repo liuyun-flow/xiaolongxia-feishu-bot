@@ -8,6 +8,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "latest"
+    "@larksuiteoapi/node-sdk": "^1.24.0"
   }
 }
