@@ -266,6 +266,12 @@ async function handleFeishuMessage(data) {
     const message = data.message || {};
     const sender = data.sender || {};
 
+    // 防循环 1：忽略机器人/应用自己发出的消息，避免自己回复自己
+    if (sender.sender_type && sender.sender_type !== "user") {
+      console.log("忽略非用户消息，避免自我循环：", sender.sender_type);
+      return;
+    }
+
     const chatId = message.chat_id;
     const messageType = message.message_type;
 
@@ -275,6 +281,18 @@ async function handleFeishuMessage(data) {
       "unknown_user";
 
     if (!chatId) return;
+
+    // 防循环 2：用 message_id 去重，避免飞书事件重推导致重复回复
+    const messageId = message.message_id;
+    if (messageId) {
+      const dedupeKey = `event:${messageId}`;
+      const existed = await MEMORY.get(dedupeKey);
+      if (existed) {
+        console.log("忽略重复消息事件：", messageId);
+        return;
+      }
+      await MEMORY.put(dedupeKey, "1", { expirationTtl: 600 });
+    }
 
     if (messageType !== "text") {
       await sendFeishuText(chatId, "我现在先支持文字。图片、文件、飞书文档读取可以后面再加。");
@@ -292,6 +310,21 @@ async function handleFeishuMessage(data) {
     userText = cleanFeishuText(userText);
 
     if (!userText.trim()) return;
+
+    // 防循环 3：兜底忽略机器人自己常发的提示语
+    const selfMessages = new Set([
+      "收到，我想一下。",
+      "这个问题可能需要最新信息，我先查一下。",
+      "我去网上查一下。",
+      "我尝试读取这个网页。",
+      "我开始复盘最近对话，并更新长期偏好/Skill。",
+      "我会把这段经验整理成一个 Skill。",
+    ]);
+
+    if (selfMessages.has(userText)) {
+      console.log("忽略疑似机器人自发提示语：", userText);
+      return;
+    }
 
     console.log(`收到消息 chat=${chatId} user=${userId}:`, userText);
 
