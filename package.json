@@ -1,0 +1,13 @@
+{
+  "name": "xiaolongxia-feishu-bot",
+  "version": "1.0.0",
+  "description": "Feishu Xiaolongxia AI Bot with DeepSeek",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "latest"
+  }
+}
