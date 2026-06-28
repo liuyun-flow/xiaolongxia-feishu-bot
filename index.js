@@ -4,6 +4,25 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import {
+  createFireAndForgetEventHandler,
+  createOutboundMessageKey,
+  createTimeoutSignal,
+  isAdminUser,
+  isSafeHttpUrl,
+  resolveFeishuLoggerLevel,
+  shouldSendProgressMessages,
+  withTimeout,
+} from "./src/stability.js";
+import {
+  buildAutoSearchQuery,
+  buildLearningChangeGate,
+  extractHttpUrls,
+  normalizeFeishuMessagesForLearning,
+  parseLearningHours,
+  shouldAutoSearchLearn,
+  shouldCommitLearningChange,
+} from "./src/learning.js";
 
 /**
  * Xiaolongxia AI - Railway Node.js + Feishu Official SDK Long Connection
@@ -25,6 +44,18 @@ const {
   PORT = "3000",
   MEMORY_FILE = "./memory.json",
   SCHEDULE_INTERVAL_MS = String(24 * 60 * 60 * 1000),
+  ADMIN_USER_IDS = "",
+  REQUEST_TIMEOUT_MS = "30000",
+  SEND_PROGRESS_MESSAGES = "false",
+  GLOBAL_SKILL_FILES = "./global-skills/树林准则_AI版.md;./global-skills/小龙虾成长准则.md",
+  ENABLE_AUTO_GROUP_LEARNING = "false",
+  ENABLE_AUTO_WEB_LEARNING = "true",
+  ENABLE_AUTO_SEARCH_LEARNING = "true",
+  AUTO_WEB_LEARNING_MAX_URLS = "2",
+  AUTO_SEARCH_LEARNING_DAILY_LIMIT = "5",
+  GROUP_LEARNING_INTERVAL_MS = String(60 * 60 * 1000),
+  GROUP_LEARNING_LOOKBACK_HOURS = "24",
+  BOT_OPEN_ID = "",
 } = process.env;
 
 console.log("========== 小龙虾 AI 启动 ==========");
@@ -35,6 +66,11 @@ console.log("TAVILY_API_KEY 存在：", Boolean(TAVILY_API_KEY));
 console.log("DATABASE_URL 存在：", Boolean(DATABASE_URL));
 console.log("DEEPSEEK_MODEL：", DEEPSEEK_MODEL);
 console.log("MEMORY_FILE：", MEMORY_FILE);
+console.log("ADMIN_USER_IDS 已配置：", Boolean(ADMIN_USER_IDS));
+console.log("SEND_PROGRESS_MESSAGES：", shouldSendProgressMessages(SEND_PROGRESS_MESSAGES));
+console.log("ENABLE_AUTO_GROUP_LEARNING：", ENABLE_AUTO_GROUP_LEARNING);
+console.log("ENABLE_AUTO_WEB_LEARNING：", ENABLE_AUTO_WEB_LEARNING);
+console.log("ENABLE_AUTO_SEARCH_LEARNING：", ENABLE_AUTO_SEARCH_LEARNING);
 
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
   console.error("启动失败：缺少 FEISHU_APP_ID 或 FEISHU_APP_SECRET");
@@ -234,14 +270,12 @@ const baseConfig = {
 const feishuClient = new Lark.Client(baseConfig);
 
 const eventDispatcher = new Lark.EventDispatcher({}).register({
-  "im.message.receive_v1": async (data) => {
-    await handleFeishuMessage(data);
-  },
+  "im.message.receive_v1": createFireAndForgetEventHandler(handleFeishuMessage),
 });
 
 const wsClient = new Lark.WSClient({
   ...baseConfig,
-  loggerLevel: Lark.LoggerLevel.debug,
+  loggerLevel: resolveFeishuLoggerLevel(Lark.LoggerLevel, process.env.FEISHU_LOG_LEVEL),
 });
 
 console.log("正在使用官方 SDK 启动飞书长连接客户端 WSClient...");
@@ -261,6 +295,17 @@ if (scheduleInterval > 0) {
   console.log(`定时复盘已启用，间隔 ${scheduleInterval}ms`);
 }
 
+const learningInterval = Number(GROUP_LEARNING_INTERVAL_MS);
+if (learningInterval > 0) {
+  setInterval(() => {
+    runAutoGroupLearning().catch((error) => {
+      console.error("Auto group learning failed:", error);
+    });
+  }, learningInterval);
+
+  console.log(`群聊自动学习检查已启用，间隔 ${learningInterval}ms`);
+}
+
 async function handleFeishuMessage(data) {
   try {
     const message = data.message || {};
@@ -274,13 +319,17 @@ async function handleFeishuMessage(data) {
 
     const chatId = message.chat_id;
     const messageType = message.message_type;
+    const chatType = message.chat_type || "";
 
     const userId =
       sender.sender_id?.open_id ||
       sender.sender_id?.user_id ||
       "unknown_user";
+    const openId = sender.sender_id?.open_id || "";
+    const feishuUserId = sender.sender_id?.user_id || "";
 
     if (!chatId) return;
+    await rememberLearningChat(chatId, chatType);
 
     // 防循环 2：用 message_id 去重，避免飞书事件重推导致重复回复
     const messageId = message.message_id;
@@ -311,10 +360,16 @@ async function handleFeishuMessage(data) {
 
     if (!userText.trim()) return;
 
+    const outboundKey = createOutboundMessageKey(chatId, userText);
+    const isBotEcho = await MEMORY.get(outboundKey);
+    if (isBotEcho) {
+      console.log("忽略机器人自己发出的消息回流：", userText.slice(0, 80));
+      return;
+    }
+
     // 防循环 3：兜底忽略机器人自己常发的提示语
     const selfMessages = new Set([
       "收到，我想一下。",
-      "这个问题可能需要最新信息，我先查一下。",
       "我去网上查一下。",
       "我尝试读取这个网页。",
       "我开始复盘最近对话，并更新长期偏好/Skill。",
@@ -335,6 +390,11 @@ async function handleFeishuMessage(data) {
     }
 
     if (userText === "/绑定主人") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
       await MEMORY.put("admin:chat_id", chatId);
       await sendFeishuText(chatId, "已绑定。以后定时复盘会发到这个会话。");
       return;
@@ -354,7 +414,7 @@ async function handleFeishuMessage(data) {
 
     if (userText.startsWith("/搜索 ")) {
       const query = userText.replace("/搜索 ", "").trim();
-      await sendFeishuText(chatId, "我去网上查一下。");
+      await sendProgressText(chatId, "我去网上查一下。");
       const searchContext = await webSearch(query, { force: true });
       const answer = await answerWithSearch(query, searchContext);
       await sendFeishuText(chatId, answer);
@@ -363,27 +423,97 @@ async function handleFeishuMessage(data) {
 
     if (userText.startsWith("/爬取 ")) {
       const url = userText.replace("/爬取 ", "").trim();
-      await sendFeishuText(chatId, "我尝试读取这个网页。");
+      await sendProgressText(chatId, "我尝试读取这个网页。");
       const page = await fetchPageText(url);
       const summary = await summarizePage(url, page);
       await sendFeishuText(chatId, summary);
       return;
     }
 
+    if (userText.startsWith("/学习网页 ")) {
+      const url = userText.replace("/学习网页 ", "").trim();
+      const result = await learnFromWebPage(url, userId, {
+        manual: true,
+        force: true,
+      });
+      await sendFeishuText(chatId, result);
+      return;
+    }
+
+    if (userText.startsWith("/搜索学习 ")) {
+      const query = userText.replace("/搜索学习 ", "").trim();
+      await sendProgressText(chatId, "我去搜索并学习。");
+      const result = await learnFromSearchQuery(query, userId, {
+        manual: true,
+        force: true,
+      });
+      await sendFeishuText(chatId, result);
+      return;
+    }
+
     if (userText.startsWith("/沉淀skill ")) {
       const raw = userText.replace("/沉淀skill ", "").trim();
-      await sendFeishuText(chatId, "我会把这段经验整理成一个 Skill。");
+      await sendProgressText(chatId, "我会把这段经验整理成一个 Skill。");
       const saved = await createSkillFromText(raw, userId);
       await sendFeishuText(chatId, saved);
       return;
     }
 
     if (userText === "/复盘") {
-      await sendFeishuText(chatId, "我开始复盘最近对话，并更新长期偏好/Skill。");
+      await sendProgressText(chatId, "我开始复盘最近对话，并更新长期偏好/Skill。");
       const result = await reflectAndLearn(chatId, userId, { manual: true });
       await sendFeishuText(chatId, result);
       return;
     }
+
+    if (userText.startsWith("/学习群聊")) {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      const hours = parseLearningHours(userText.replace("/学习群聊", ""));
+      const result = await learnFromChat(chatId, userId, hours, { manual: true });
+      await sendFeishuText(chatId, result);
+      return;
+    }
+
+    if (userText === "/学习笔记") {
+      const notes = await listLearningNotes();
+      await sendFeishuText(chatId, notes);
+      return;
+    }
+
+    if (userText === "/进化日志") {
+      const logs = await listEvolutionLogs();
+      await sendFeishuText(chatId, logs);
+      return;
+    }
+
+    if (userText === "/开启自动学习") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      await MEMORY.put("learning:auto_enabled", "true");
+      await sendFeishuText(chatId, "已开启自动群聊学习。小龙虾会定期读取已登记群聊的最近消息，提炼长期记忆和候选 Skill。");
+      return;
+    }
+
+    if (userText === "/关闭自动学习") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      await MEMORY.put("learning:auto_enabled", "false");
+      await sendFeishuText(chatId, "已关闭自动群聊学习。");
+      return;
+    }
+
+    scheduleAutoWebLearningFromText(userText, userId);
+    scheduleAutoSearchLearningFromText(userText, userId);
 
     // 正常聊天
     await handleNormalChat(chatId, userId, userText);
@@ -398,16 +528,16 @@ async function handleNormalChat(chatId, userId, userText) {
 
   const history = await getJson(mKey, []);
   const profile = await MEMORY.get(profileKey) || "";
+  const selfProfile = await MEMORY.get("self:learned_profile") || "";
+  const dynamicPrompt = await MEMORY.get("self:dynamic_prompt") || "";
   const skills = await getRelevantSkills(userText);
+  const globalSkills = await getGlobalSkillsText();
 
   const needWeb = shouldUseWeb(userText);
   let webContext = "";
 
   if (needWeb) {
-    await sendFeishuText(chatId, "这个问题可能需要最新信息，我先查一下。");
     webContext = await webSearch(userText, { force: false });
-  } else {
-    await sendFeishuText(chatId, "收到，我想一下。");
   }
 
   const recentHistory = history.slice(-24);
@@ -415,7 +545,11 @@ async function handleNormalChat(chatId, userId, userText) {
   const reply = await callDeepSeek([
     {
       role: "system",
-      content: buildSystemPrompt(profile, skills, webContext),
+      content: buildSystemPrompt(profile, skills, webContext, {
+        globalSkills,
+        selfProfile,
+        dynamicPrompt,
+      }),
     },
     ...recentHistory,
     {
@@ -448,7 +582,7 @@ async function handleNormalChat(chatId, userId, userText) {
   }
 }
 
-function buildSystemPrompt(profile, skills, webContext) {
+function buildSystemPrompt(profile, skills, webContext, options = {}) {
   return `你是“小龙虾AI”，一个在飞书里工作的中文个人 Agent。
 
 你的目标：
@@ -463,6 +597,15 @@ function buildSystemPrompt(profile, skills, webContext) {
 
 用户长期偏好：
 ${profile || "暂无"}
+
+小龙虾自我学习记忆：
+${options.selfProfile || "暂无"}
+
+受保护的全局准则：
+${options.globalSkills || "暂无"}
+
+小龙虾动态进化提示：
+${options.dynamicPrompt || "暂无"}
 
 可调用的内部 Skill：
 ${skills || "暂无"}
@@ -516,6 +659,32 @@ function shouldUseWeb(text) {
   return keywords.some(k => t.includes(k));
 }
 
+let globalSkillsCache = null;
+
+async function getGlobalSkillsText() {
+  if (globalSkillsCache) return globalSkillsCache;
+
+  const files = String(GLOBAL_SKILL_FILES || "")
+    .split(/[;,]/)
+    .map(item => item.trim())
+    .filter(Boolean);
+
+  const parts = [];
+
+  for (const file of files) {
+    try {
+      const fullPath = path.resolve(file);
+      const content = await fs.readFile(fullPath, "utf8");
+      parts.push(`文件：${path.basename(file)}\n${content.trim()}`);
+    } catch (error) {
+      console.warn("Global skill file load failed:", file, error.message);
+    }
+  }
+
+  globalSkillsCache = parts.join("\n\n---\n\n").slice(0, 26000);
+  return globalSkillsCache;
+}
+
 async function webSearch(query, options = {}) {
   if (!TAVILY_API_KEY) {
     return "未配置 TAVILY_API_KEY，无法联网搜索。";
@@ -529,50 +698,56 @@ async function webSearch(query, options = {}) {
 
   const isNews = /新闻|今天|昨天|最新|发布|突发|政策|财经|股价|体育/.test(query);
 
-  const res = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${TAVILY_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query,
-      search_depth: "basic",
-      topic: isNews ? "news" : "general",
-      max_results: 5,
-      include_answer: true,
-      include_raw_content: false,
-      include_favicon: false,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    return `联网搜索失败：${res.status} ${err}`;
-  }
-
-  const data = await res.json();
-
-  const parts = [];
-
-  if (data.answer) {
-    parts.push(`搜索摘要：${data.answer}`);
-  }
-
-  if (Array.isArray(data.results)) {
-    parts.push("搜索结果：");
-    data.results.slice(0, 5).forEach((r, idx) => {
-      parts.push(`${idx + 1}. ${r.title}\nURL: ${r.url}\n摘要: ${r.content || ""}`);
+  try {
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${TAVILY_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        search_depth: "basic",
+        topic: isNews ? "news" : "general",
+        max_results: 5,
+        include_answer: true,
+        include_raw_content: false,
+        include_favicon: false,
+      }),
+      signal: createTimeoutSignal(requestTimeoutMs()),
     });
+
+    if (!res.ok) {
+      const err = await res.text();
+      return `联网搜索失败：${res.status} ${err.slice(0, 1000)}`;
+    }
+
+    const data = await res.json();
+
+    const parts = [];
+
+    if (data.answer) {
+      parts.push(`搜索摘要：${data.answer}`);
+    }
+
+    if (Array.isArray(data.results)) {
+      parts.push("搜索结果：");
+      data.results.slice(0, 5).forEach((r, idx) => {
+        parts.push(`${idx + 1}. ${r.title}\nURL: ${r.url}\n摘要: ${r.content || ""}`);
+      });
+    }
+
+    const result = parts.join("\n\n").slice(0, 8000);
+
+    await MEMORY.put(cacheKey, result, {
+      expirationTtl: 60 * 60 * 12,
+    });
+
+    return result;
+  } catch (error) {
+    console.error("webSearch error:", error);
+    return `联网搜索异常：${formatExternalError(error)}`;
   }
-
-  const result = parts.join("\n\n").slice(0, 8000);
-
-  await MEMORY.put(cacheKey, result, {
-    expirationTtl: 60 * 60 * 12,
-  });
-
-  return result;
 }
 
 async function answerWithSearch(query, searchContext) {
@@ -602,10 +777,16 @@ async function fetchPageText(url) {
       return "URL 格式不正确，必须以 http:// 或 https:// 开头。";
     }
 
+    const safe = await isSafeHttpUrl(url, { resolveDns: true });
+    if (!safe) {
+      return "URL 不安全或不可访问，已拒绝读取。请使用公开网站的 http/https 链接。";
+    }
+
     const res = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 XiaolongxiaAI/1.0",
       },
+      signal: createTimeoutSignal(requestTimeoutMs()),
     });
 
     if (!res.ok) {
@@ -628,8 +809,161 @@ async function fetchPageText(url) {
 
     return text.slice(0, 12000);
   } catch (e) {
-    return `网页读取异常：${String(e.message || e)}`;
+    return `网页读取异常：${formatExternalError(e)}`;
   }
+}
+
+function isAutoWebLearningEnabled() {
+  return ["1", "true", "yes", "on"].includes(String(ENABLE_AUTO_WEB_LEARNING || "").toLowerCase());
+}
+
+function isAutoSearchLearningEnabled() {
+  return ["1", "true", "yes", "on"].includes(String(ENABLE_AUTO_SEARCH_LEARNING || "").toLowerCase());
+}
+
+function autoSearchDailyLimit() {
+  const limit = Number(AUTO_SEARCH_LEARNING_DAILY_LIMIT);
+  if (!Number.isFinite(limit)) return 5;
+  return Math.max(0, Math.min(50, Math.floor(limit)));
+}
+
+function scheduleAutoWebLearningFromText(text, userId) {
+  if (!isAutoWebLearningEnabled()) return;
+
+  const limit = Math.max(1, Math.min(5, Number(AUTO_WEB_LEARNING_MAX_URLS) || 2));
+  const urls = extractHttpUrls(text, limit);
+
+  for (const url of urls) {
+    learnFromWebPage(url, userId, {
+      manual: false,
+      force: false,
+    }).catch(error => {
+      console.error("Auto web learning failed:", error);
+    });
+  }
+}
+
+function scheduleAutoSearchLearningFromText(text, userId) {
+  if (!isAutoSearchLearningEnabled() || !TAVILY_API_KEY) return;
+  if (!shouldAutoSearchLearn(text)) return;
+
+  const query = buildAutoSearchQuery(text);
+  if (!query) return;
+
+  learnFromSearchQuery(query, userId, {
+    manual: false,
+    force: false,
+  }).catch(error => {
+    console.error("Auto search learning failed:", error);
+  });
+}
+
+async function learnFromWebPage(url, userId, options = {}) {
+  const safe = await isSafeHttpUrl(url, { resolveDns: true });
+  if (!safe) {
+    return "网页学习失败：URL 不安全或不可访问。请使用公开网站的 http/https 链接。";
+  }
+
+  const learningKey = `learning:web:${simpleHash(url)}`;
+  if (!options.force) {
+    const learned = await MEMORY.get(learningKey);
+    if (learned) {
+      return "网页已学习过，跳过重复学习。";
+    }
+  }
+
+  const pageText = await fetchPageText(url);
+  if (!pageText || pageText.startsWith("URL ") || pageText.startsWith("网页读取") || pageText.startsWith("URL 不安全")) {
+    return `网页学习失败：${pageText || "没有读取到内容"}`;
+  }
+
+  const result = await analyzeAndApplyLearning({
+    source: "web_page",
+    url,
+    userId,
+    messages: [
+      {
+        messageId: `web:${simpleHash(url)}`,
+        senderId: userId,
+        createTime: new Date().toISOString(),
+        text: `URL：${url}\n\n网页内容：${pageText.slice(0, 12000)}`,
+      },
+    ],
+  });
+
+  await MEMORY.put(learningKey, new Date().toISOString(), {
+    expirationTtl: 60 * 60 * 24 * 30,
+  });
+
+  return options.manual ? result : "web learning complete";
+}
+
+async function learnFromSearchQuery(rawQuery, userId, options = {}) {
+  const query = buildAutoSearchQuery(rawQuery);
+  if (!query) {
+    return "搜索学习失败：没有可搜索的主题。";
+  }
+
+  if (!TAVILY_API_KEY) {
+    return "搜索学习失败：未配置 TAVILY_API_KEY。自动网页链接学习可以继续，但主动搜索网页需要 Tavily。";
+  }
+
+  const learningKey = `learning:search:${simpleHash(query.toLowerCase())}`;
+  if (!options.force) {
+    const learned = await MEMORY.get(learningKey);
+    if (learned) {
+      return "这个主题近期已搜索学习过，跳过重复学习。";
+    }
+  }
+
+  if (!options.manual) {
+    const quotaOk = await consumeAutoSearchLearningQuota();
+    if (!quotaOk) {
+      return "自动搜索学习今日额度已用完，跳过。";
+    }
+  }
+
+  const searchContext = await webSearch(query, { force: true });
+  if (!searchContext || /^(未配置|联网搜索失败|联网搜索异常)/.test(searchContext)) {
+    return `搜索学习失败：${searchContext || "没有搜索结果"}`;
+  }
+
+  const result = await analyzeAndApplyLearning({
+    source: "web_search",
+    query,
+    userId,
+    messages: [
+      {
+        messageId: `search:${simpleHash(query)}`,
+        senderId: userId,
+        createTime: new Date().toISOString(),
+        text: `搜索主题：${query}\n\n联网搜索资料：${searchContext.slice(0, 10000)}`,
+      },
+    ],
+  });
+
+  await MEMORY.put(learningKey, new Date().toISOString(), {
+    expirationTtl: 60 * 60 * 24 * 14,
+  });
+
+  return options.manual ? result : "search learning complete";
+}
+
+async function consumeAutoSearchLearningQuota() {
+  const limit = autoSearchDailyLimit();
+  if (limit <= 0) return false;
+
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `learning:search:daily:${day}`;
+  const used = Number(await MEMORY.get(key) || "0");
+
+  if (used >= limit) return false;
+
+  await MEMORY.put(key, String(used + 1), {
+    expirationTtl: 60 * 60 * 48,
+  });
+
+  return true;
 }
 
 async function summarizePage(url, pageText) {
@@ -655,6 +989,409 @@ ${pageText}
     thinking: "disabled",
     maxTokens: 1800,
   });
+}
+
+async function rememberLearningChat(chatId, chatType = "") {
+  const index = await getJson("learning:chats:index", []);
+  const next = [
+    {
+      chatId,
+      chatType,
+      updatedAt: new Date().toISOString(),
+    },
+    ...index.filter(item => item.chatId !== chatId),
+  ].slice(0, 50);
+
+  await MEMORY.put("learning:chats:index", JSON.stringify(next), {
+    expirationTtl: 60 * 60 * 24 * 180,
+  });
+}
+
+async function isAutoLearningEnabled() {
+  const stored = await MEMORY.get("learning:auto_enabled");
+  if (stored === "true") return true;
+  if (stored === "false") return false;
+  return ["1", "true", "yes", "on"].includes(String(ENABLE_AUTO_GROUP_LEARNING || "").toLowerCase());
+}
+
+async function runAutoGroupLearning() {
+  if (!await isAutoLearningEnabled()) return;
+
+  const index = await getJson("learning:chats:index", []);
+  const groupChats = index.filter(item => item.chatType === "group");
+
+  if (!groupChats.length) {
+    console.log("Auto learning skipped: no group chats registered.");
+    return;
+  }
+
+  const hours = parseLearningHours(GROUP_LEARNING_LOOKBACK_HOURS);
+
+  for (const item of groupChats.slice(0, 10)) {
+    const lastKey = `learning:last_run:${item.chatId}`;
+    const lastRun = Number(await MEMORY.get(lastKey) || "0");
+    if (Date.now() - lastRun < Math.max(learningInterval, 60 * 60 * 1000) * 0.8) {
+      continue;
+    }
+
+    await learnFromChat(item.chatId, "auto_group_learning", hours, { manual: false });
+    await MEMORY.put(lastKey, String(Date.now()), {
+      expirationTtl: 60 * 60 * 24 * 30,
+    });
+  }
+}
+
+async function learnFromChat(chatId, userId, hours, options = {}) {
+  try {
+    const messages = await fetchFeishuChatMessages(chatId, hours);
+    const normalized = normalizeFeishuMessagesForLearning(messages, {
+      botOpenId: BOT_OPEN_ID,
+    });
+
+    if (!normalized.length) {
+      return `没有读到可学习的群聊文本。请确认机器人在群里，并已开通读取群历史消息相关权限。`;
+    }
+
+    const result = await analyzeAndApplyLearning({
+      source: "feishu_group_chat",
+      chatId,
+      userId,
+      hours,
+      messages: normalized,
+    });
+
+    return options.manual ? result : "auto learning complete";
+  } catch (error) {
+    console.error("learnFromChat error:", error);
+    return `群聊学习失败：${formatExternalError(error)}`;
+  }
+}
+
+async function fetchFeishuChatMessages(chatId, hours) {
+  const token = await getTenantAccessToken();
+  const endTime = Math.floor(Date.now() / 1000);
+  const startTime = endTime - parseLearningHours(hours) * 60 * 60;
+  const all = [];
+  let pageToken = "";
+
+  for (let i = 0; i < 5; i++) {
+    const params = new URLSearchParams({
+      container_id_type: "chat",
+      container_id: chatId,
+      start_time: String(startTime),
+      end_time: String(endTime),
+      page_size: "50",
+      sort_type: "ByCreateTimeAsc",
+    });
+
+    if (pageToken) params.set("page_token", pageToken);
+
+    const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?${params.toString()}`, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+      },
+      signal: createTimeoutSignal(requestTimeoutMs()),
+    });
+
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text || "{}");
+    } catch {
+      throw new Error(`飞书历史消息接口返回非 JSON：${text.slice(0, 300)}`);
+    }
+
+    if (!res.ok || data.code !== 0) {
+      throw new Error(`飞书历史消息读取失败：${res.status} ${data.msg || text.slice(0, 500)}`);
+    }
+
+    all.push(...(data.data?.items || []));
+    if (!data.data?.has_more) break;
+    pageToken = data.data?.page_token || "";
+    if (!pageToken) break;
+  }
+
+  return all;
+}
+
+async function getTenantAccessToken() {
+  const cached = await MEMORY.get("feishu:tenant_access_token");
+  if (cached) return cached;
+
+  const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      app_id: FEISHU_APP_ID,
+      app_secret: FEISHU_APP_SECRET,
+    }),
+    signal: createTimeoutSignal(requestTimeoutMs()),
+  });
+
+  const data = await res.json();
+  if (!res.ok || data.code !== 0 || !data.tenant_access_token) {
+    throw new Error(`tenant_access_token 获取失败：${data.msg || res.status}`);
+  }
+
+  await MEMORY.put("feishu:tenant_access_token", data.tenant_access_token, {
+    expirationTtl: Math.max(60, Number(data.expire || 7200) - 300),
+  });
+
+  return data.tenant_access_token;
+}
+
+async function analyzeAndApplyLearning(context) {
+  const globalSkills = await getGlobalSkillsText();
+  const oldSelfProfile = await MEMORY.get("self:learned_profile") || "";
+  const oldDynamicPrompt = await MEMORY.get("self:dynamic_prompt") || "";
+
+  const jsonText = await callDeepSeek([
+    {
+      role: "system",
+      content: `你是小龙虾的自我学习模块。
+你可以更新小龙虾的长期记忆、候选 Skill、动态提示词，但必须遵守全局准则和成长宪法。
+
+硬规则：
+1. 只吸收结构、判断标准、可复用方法、反例，不吸收一次性情绪和低质叙事。
+2. 不允许修改受保护内核：目的、北极星、成长红线、自我进化协议。
+3. 动态提示词只能补充执行细节，不能覆盖全局准则。
+4. 必须输出 JSON，不要输出 JSON 以外内容。
+
+输出格式：
+{
+  "updated_self_profile": "更新后的小龙虾长期自我学习记忆，保留旧内容，压缩到可靠结构",
+  "learning_notes": [
+    {
+      "title": "学习笔记标题",
+      "summary": "学到了什么结构",
+      "evidence": "依据来自哪类群聊内容，不要大段引用原文",
+      "confidence": 0.0
+    }
+  ],
+  "new_skills": [
+    {
+      "name": "Skill 名称",
+      "trigger": "什么时候触发",
+      "instruction": "执行方法",
+      "example": "简短示例",
+      "confidence": 0.0
+    }
+  ],
+  "dynamic_prompt_patch": {
+    "content": "如果确实需要改动态提示词，给出完整替换文本；否则为空字符串",
+    "reason": "为什么这次改动三年后仍然有用",
+    "confidence": 0.0,
+    "change_gate": {
+      "target": "prompt",
+      "touchesProtectedCore": false,
+      "compounds": true,
+      "focused": true,
+      "calm": true,
+      "redlineSafe": true,
+      "sourced": true,
+      "reversible": true
+    }
+  }
+}
+
+全局准则：
+${globalSkills}`,
+    },
+    {
+      role: "user",
+      content: `旧自我学习记忆：
+${oldSelfProfile || "暂无"}
+
+旧动态提示词：
+${oldDynamicPrompt || "暂无"}
+
+学习来源：${context.source}
+${context.chatId ? `群聊 ID：${context.chatId}` : ""}
+${context.url ? `网页 URL：${context.url}` : ""}
+${context.query ? `搜索主题：${context.query}` : ""}
+${context.hours ? `时间范围：最近 ${context.hours} 小时` : ""}
+
+学习材料：
+${JSON.stringify(context.messages.slice(-120), null, 2)}
+
+请学习并输出 JSON。`,
+    },
+  ], {
+    thinking: "disabled",
+    json: true,
+    maxTokens: 3000,
+  });
+
+  const data = safeJsonParse(jsonText);
+  if (!data) {
+    return "学习失败：模型没有返回可解析 JSON。";
+  }
+
+  let savedNotes = 0;
+  let savedSkills = 0;
+  let promptUpdated = false;
+
+  if (data.updated_self_profile) {
+    await MEMORY.put("self:learned_profile", String(data.updated_self_profile).slice(0, 8000));
+  }
+
+  if (Array.isArray(data.learning_notes)) {
+    for (const note of data.learning_notes) {
+      if (Number(note.confidence || 0) >= 0.65 && note.title && note.summary) {
+        await saveLearningNote(note, context);
+        savedNotes++;
+      }
+    }
+  }
+
+  if (Array.isArray(data.new_skills)) {
+    for (const skill of data.new_skills) {
+      if (Number(skill.confidence || 0) >= 0.72 && skill.name && skill.instruction) {
+        await saveSkill({
+          name: skill.name,
+          trigger: skill.trigger || "",
+          instruction: skill.instruction,
+          example: skill.example || "",
+          source: context.source || "learning",
+          createdBy: context.userId,
+        });
+        savedSkills++;
+      }
+    }
+  }
+
+  const patch = data.dynamic_prompt_patch || {};
+  if (patch.content && Number(patch.confidence || 0) >= 0.75) {
+    const gate = buildLearningChangeGate(patch.change_gate || {});
+    if (shouldCommitLearningChange(gate)) {
+      await MEMORY.put("self:dynamic_prompt", String(patch.content).slice(0, 5000));
+      await saveEvolutionLog({
+        target: "prompt",
+        reason: patch.reason || "",
+        previous: oldDynamicPrompt,
+        next: String(patch.content).slice(0, 5000),
+        gate,
+        source: context.source,
+      });
+      promptUpdated = true;
+    } else {
+      await saveEvolutionLog({
+        target: "prompt",
+        reason: patch.reason || "未通过进化闸门",
+        previous: oldDynamicPrompt,
+        next: String(patch.content).slice(0, 5000),
+        gate,
+        source: context.source,
+        outcome: "not_committed",
+      });
+    }
+  }
+
+  const sourceTitle = {
+    feishu_group_chat: "群聊学习完成。",
+    web_page: "网页学习完成。",
+    web_search: "搜索学习完成。",
+  }[context.source] || "学习完成。";
+
+  return [
+    sourceTitle,
+    "",
+    `读取材料：${context.messages.length} 条`,
+    `新增学习笔记：${savedNotes} 条`,
+    `新增 Skill：${savedSkills} 个`,
+    `动态提示词更新：${promptUpdated ? "是" : "否"}`,
+  ].join("\n");
+}
+
+async function saveLearningNote(note, context) {
+  const id = `note_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const full = {
+    id,
+    title: String(note.title || "").slice(0, 120),
+    summary: String(note.summary || "").slice(0, 2000),
+    evidence: String(note.evidence || "").slice(0, 1000),
+    confidence: Number(note.confidence || 0),
+    source: context.source,
+    chatId: context.chatId || "",
+    url: context.url || "",
+    query: context.query || "",
+    createdAt: new Date().toISOString(),
+  };
+
+  await MEMORY.put(`learning_note:${id}`, JSON.stringify(full));
+
+  const index = await getJson("learning:notes:index", []);
+  index.unshift({
+    id,
+    title: full.title,
+    confidence: full.confidence,
+    createdAt: full.createdAt,
+  });
+  await MEMORY.put("learning:notes:index", JSON.stringify(index.slice(0, 80)));
+
+  return full;
+}
+
+async function listLearningNotes() {
+  const index = await getJson("learning:notes:index", []);
+
+  if (!index.length) {
+    return "当前还没有学习笔记。你可以发送：/学习群聊 24小时";
+  }
+
+  const rows = [];
+  for (const item of index.slice(0, 10)) {
+    const full = await getJson(`learning_note:${item.id}`, null);
+    if (!full) continue;
+    rows.push(`${rows.length + 1}. ${full.title}\n${full.summary}`);
+  }
+
+  return ["最近学习笔记：", "", ...rows].join("\n\n").slice(0, 6000);
+}
+
+async function saveEvolutionLog(log) {
+  const id = `evolution_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const full = {
+    id,
+    target: log.target,
+    reason: String(log.reason || "").slice(0, 1000),
+    previous: String(log.previous || "").slice(0, 2000),
+    next: String(log.next || "").slice(0, 2000),
+    gate: log.gate || null,
+    source: log.source || "unknown",
+    outcome: log.outcome || log.gate?.outcome || "unknown",
+    createdAt: new Date().toISOString(),
+  };
+
+  await MEMORY.put(`evolution_log:${id}`, JSON.stringify(full));
+  const index = await getJson("evolution:logs:index", []);
+  index.unshift({
+    id,
+    target: full.target,
+    outcome: full.outcome,
+    createdAt: full.createdAt,
+  });
+  await MEMORY.put("evolution:logs:index", JSON.stringify(index.slice(0, 50)));
+}
+
+async function listEvolutionLogs() {
+  const index = await getJson("evolution:logs:index", []);
+
+  if (!index.length) {
+    return "当前还没有进化日志。";
+  }
+
+  const rows = [];
+  for (const item of index.slice(0, 10)) {
+    const full = await getJson(`evolution_log:${item.id}`, null);
+    if (!full) continue;
+    rows.push(`${rows.length + 1}. ${full.createdAt}｜${full.target}｜${full.outcome}\n原因：${full.reason || "无"}`);
+  }
+
+  return ["最近进化日志：", "", ...rows].join("\n\n").slice(0, 6000);
 }
 
 async function reflectAndLearn(chatId, userId, options = {}) {
@@ -927,6 +1664,10 @@ ${JSON.stringify(skills.slice(0, 50), null, 2)}
 }
 
 async function callDeepSeek(messages, options = {}) {
+  if (!DEEPSEEK_API_KEY) {
+    return "未配置 DEEPSEEK_API_KEY，无法调用 DeepSeek。";
+  }
+
   const body = {
     model: DEEPSEEK_MODEL || "deepseek-v4-pro",
     messages,
@@ -947,35 +1688,41 @@ async function callDeepSeek(messages, options = {}) {
     body.temperature = 0.2;
   }
 
-  const response = await fetch("https://api.deepseek.com/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  try {
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: createTimeoutSignal(requestTimeoutMs()),
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error("DeepSeek HTTP error:", response.status, errorText);
-    return `DeepSeek 调用失败：${response.status}
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("DeepSeek HTTP error:", response.status, errorText);
+      return `DeepSeek 调用失败：${response.status}
 
 请检查：
 1. DEEPSEEK_API_KEY 是否正确
 2. DEEPSEEK_MODEL 是否可用
 3. 账户余额是否充足
 4. Railway 环境变量是否保存并重新部署`;
+    }
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.error("DeepSeek API error:", data.error);
+      return `DeepSeek 返回错误：${data.error.message || "未知错误"}`;
+    }
+
+    return data.choices?.[0]?.message?.content?.trim() || "DeepSeek 返回为空。";
+  } catch (error) {
+    console.error("DeepSeek request error:", error);
+    return `DeepSeek 调用异常：${formatExternalError(error)}`;
   }
-
-  const data = await response.json();
-
-  if (data.error) {
-    console.error("DeepSeek API error:", data.error);
-    return `DeepSeek 返回错误：${data.error.message || "未知错误"}`;
-  }
-
-  return data.choices?.[0]?.message?.content?.trim() || "DeepSeek 返回为空。";
 }
 
 async function sendFeishuText(chatId, text) {
@@ -983,22 +1730,35 @@ async function sendFeishuText(chatId, text) {
 
   for (const chunk of chunks) {
     try {
-      await feishuClient.im.v1.message.create({
-        params: {
-          receive_id_type: "chat_id",
-        },
-        data: {
-          receive_id: chatId,
-          msg_type: "text",
-          content: JSON.stringify({
-            text: chunk,
-          }),
-        },
+      await MEMORY.put(createOutboundMessageKey(chatId, chunk), "1", {
+        expirationTtl: 60 * 60,
       });
+
+      await withTimeout(
+        feishuClient.im.v1.message.create({
+          params: {
+            receive_id_type: "chat_id",
+          },
+          data: {
+            receive_id: chatId,
+            msg_type: "text",
+            content: JSON.stringify({
+              text: chunk,
+            }),
+          },
+        }),
+        requestTimeoutMs(),
+        "Feishu send message"
+      );
     } catch (error) {
       console.error("Feishu send message error:", error);
     }
   }
+}
+
+async function sendProgressText(chatId, text) {
+  if (!shouldSendProgressMessages(SEND_PROGRESS_MESSAGES)) return;
+  await sendFeishuText(chatId, text);
 }
 
 function splitText(text, size) {
@@ -1020,6 +1780,19 @@ function cleanFeishuText(text) {
     .replace(/<at[^>]*>.*?<\/at>/g, "")
     .replace(/@\S+/g, "")
     .trim();
+}
+
+function requestTimeoutMs() {
+  const timeout = Number(REQUEST_TIMEOUT_MS);
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : 30000;
+}
+
+function formatExternalError(error) {
+  if (error?.name === "AbortError") {
+    return `请求超时，请稍后重试或缩小问题范围。`;
+  }
+
+  return String(error?.message || error || "未知错误").slice(0, 500);
 }
 
 function memoryKey(chatId, userId) {
@@ -1076,6 +1849,12 @@ function helpText() {
 /爬取 URL
 尝试读取并总结网页
 
+/学习网页 URL
+读取网页文章，自动提炼学习笔记和 Skill
+
+/搜索学习 主题
+搜索网页资料并自动提炼学习笔记和 Skill
+
 /复盘
 复盘最近对话，更新长期偏好和 Skill
 
@@ -1090,6 +1869,21 @@ function helpText() {
 
 /绑定主人
 把当前会话设为定时复盘接收地
+
+/学习群聊 24小时
+读取当前群最近一段时间的消息，提炼学习笔记、Skill 和动态提示词
+
+/学习笔记
+查看最近沉淀的学习笔记
+
+/进化日志
+查看小龙虾最近对自己提示词/记忆的改动记录
+
+/开启自动学习
+定期读取已登记群聊并自动学习
+
+/关闭自动学习
+停止自动读取群聊学习
 
 正常聊天时，我会自动判断是否需要联网搜索，并调用长期偏好和 Skill。`;
 }
