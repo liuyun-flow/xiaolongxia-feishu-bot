@@ -4,6 +4,7 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { buildRuntimeCapabilitySummary } from "./src/capabilities.js";
 import {
   createFireAndForgetEventHandler,
   createOutboundMessageKey,
@@ -532,6 +533,13 @@ async function handleNormalChat(chatId, userId, userText) {
   const dynamicPrompt = await MEMORY.get("self:dynamic_prompt") || "";
   const skills = await getRelevantSkills(userText);
   const globalSkills = await getGlobalSkillsText();
+  const capabilitySummary = buildRuntimeCapabilitySummary({
+    tavilyApiKey: TAVILY_API_KEY,
+    enableAutoGroupLearning: ENABLE_AUTO_GROUP_LEARNING,
+    enableAutoWebLearning: ENABLE_AUTO_WEB_LEARNING,
+    enableAutoSearchLearning: ENABLE_AUTO_SEARCH_LEARNING,
+    autoSearchLearningDailyLimit: AUTO_SEARCH_LEARNING_DAILY_LIMIT,
+  });
 
   const needWeb = shouldUseWeb(userText);
   let webContext = "";
@@ -549,6 +557,7 @@ async function handleNormalChat(chatId, userId, userText) {
         globalSkills,
         selfProfile,
         dynamicPrompt,
+        capabilitySummary,
       }),
     },
     ...recentHistory,
@@ -606,6 +615,9 @@ ${options.globalSkills || "暂无"}
 
 小龙虾动态进化提示：
 ${options.dynamicPrompt || "暂无"}
+
+小龙虾当前可用功能：
+${options.capabilitySummary || "暂无"}
 
 可调用的内部 Skill：
 ${skills || "暂无"}
