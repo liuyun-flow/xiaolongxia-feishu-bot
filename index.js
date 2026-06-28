@@ -4,6 +4,14 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import {
+  buildAgentStatusText,
+  chooseAgentAction,
+  formatAgentLogs,
+  normalizeAgentGoals,
+  parseAgentGoals,
+  shouldEnableAgent,
+} from "./src/agent.js";
 import { buildRuntimeCapabilitySummary } from "./src/capabilities.js";
 import {
   createFireAndForgetEventHandler,
@@ -56,6 +64,11 @@ const {
   AUTO_SEARCH_LEARNING_DAILY_LIMIT = "5",
   GROUP_LEARNING_INTERVAL_MS = String(60 * 60 * 1000),
   GROUP_LEARNING_LOOKBACK_HOURS = "24",
+  ENABLE_AGENT_MODE = "false",
+  AGENT_INTERVAL_MS = String(60 * 60 * 1000),
+  AGENT_DAILY_RUN_LIMIT = "3",
+  AGENT_REPORT_HOUR = "21",
+  AGENT_DEFAULT_GOALS = "持续学习用户关注的主题;自动沉淀可复用 Skill;每天总结自主学习成果",
   BOT_OPEN_ID = "",
 } = process.env;
 
@@ -72,6 +85,7 @@ console.log("SEND_PROGRESS_MESSAGES：", shouldSendProgressMessages(SEND_PROGRES
 console.log("ENABLE_AUTO_GROUP_LEARNING：", ENABLE_AUTO_GROUP_LEARNING);
 console.log("ENABLE_AUTO_WEB_LEARNING：", ENABLE_AUTO_WEB_LEARNING);
 console.log("ENABLE_AUTO_SEARCH_LEARNING：", ENABLE_AUTO_SEARCH_LEARNING);
+console.log("ENABLE_AGENT_MODE：", ENABLE_AGENT_MODE);
 
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
   console.error("启动失败：缺少 FEISHU_APP_ID 或 FEISHU_APP_SECRET");
@@ -307,6 +321,17 @@ if (learningInterval > 0) {
   console.log(`群聊自动学习检查已启用，间隔 ${learningInterval}ms`);
 }
 
+const agentInterval = Number(AGENT_INTERVAL_MS);
+if (agentInterval > 0) {
+  setInterval(() => {
+    runAgentCycle({ manual: false }).catch((error) => {
+      console.error("Agent cycle failed:", error);
+    });
+  }, agentInterval);
+
+  console.log(`Agent 自主循环检查已启用，间隔 ${agentInterval}ms`);
+}
+
 async function handleFeishuMessage(data) {
   try {
     const message = data.message || {};
@@ -510,6 +535,69 @@ async function handleFeishuMessage(data) {
 
       await MEMORY.put("learning:auto_enabled", "false");
       await sendFeishuText(chatId, "已关闭自动群聊学习。");
+      return;
+    }
+
+    if (userText === "/开启Agent") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      await MEMORY.put("agent:enabled", "true");
+      await MEMORY.put("admin:chat_id", chatId);
+      await sendFeishuText(chatId, "已开启 Agent 模式。我会按目标池自主学习、记录工作日志，并在合适时机汇报。");
+      return;
+    }
+
+    if (userText === "/关闭Agent") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      await MEMORY.put("agent:enabled", "false");
+      await sendFeishuText(chatId, "已关闭 Agent 模式。普通聊天和手动命令仍可使用。");
+      return;
+    }
+
+    if (userText === "/Agent状态") {
+      const status = await getAgentStatusText();
+      await sendFeishuText(chatId, status);
+      return;
+    }
+
+    if (userText.startsWith("/Agent目标 ")) {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      const goals = parseAgentGoals(userText.replace("/Agent目标 ", ""), defaultAgentGoals());
+      await MEMORY.put("agent:goals", JSON.stringify(goals));
+      await sendFeishuText(chatId, [
+        "已更新 Agent 目标：",
+        "",
+        ...goals.map(goal => `${goal.priority}. ${goal.text}`),
+      ].join("\n"));
+      return;
+    }
+
+    if (userText === "/Agent日志") {
+      const logs = await listAgentLogs();
+      await sendFeishuText(chatId, logs);
+      return;
+    }
+
+    if (userText === "/Agent运行") {
+      if (!isAdminUser({ openId, userId: feishuUserId }, ADMIN_USER_IDS)) {
+        await sendFeishuText(chatId, "这个命令只有管理员可以使用。请在 Railway 配置 ADMIN_USER_IDS。");
+        return;
+      }
+
+      await MEMORY.put("admin:chat_id", chatId);
+      const result = await runAgentCycle({ manual: true, requesterId: userId });
+      await sendFeishuText(chatId, result);
       return;
     }
 
@@ -976,6 +1064,239 @@ async function consumeAutoSearchLearningQuota() {
   });
 
   return true;
+}
+
+function defaultAgentGoals() {
+  return parseAgentGoals(AGENT_DEFAULT_GOALS, [
+    "持续学习用户关注的主题",
+    "自动沉淀可复用 Skill",
+    "每天总结自主学习成果",
+  ]);
+}
+
+function agentDailyLimit() {
+  const limit = Number(AGENT_DAILY_RUN_LIMIT);
+  if (!Number.isFinite(limit)) return 3;
+  return Math.max(0, Math.min(20, Math.floor(limit)));
+}
+
+function agentReportHour() {
+  const hour = Number(AGENT_REPORT_HOUR);
+  if (!Number.isFinite(hour)) return 21;
+  return Math.max(0, Math.min(23, Math.floor(hour)));
+}
+
+async function isAgentEnabled() {
+  const stored = await MEMORY.get("agent:enabled");
+  if (stored === "true") return true;
+  if (stored === "false") return false;
+  return shouldEnableAgent(ENABLE_AGENT_MODE);
+}
+
+async function getAgentGoals() {
+  const stored = await getJson("agent:goals", null);
+  return normalizeAgentGoals(stored || [], defaultAgentGoals());
+}
+
+async function getAgentStatusText() {
+  const enabled = await isAgentEnabled();
+  const goals = await getAgentGoals();
+  const day = currentAgentDay();
+  const dailyRuns = Number(await MEMORY.get(`agent:daily_runs:${day}`) || "0");
+  const lastRun = await MEMORY.get("agent:last_run") || "";
+
+  return buildAgentStatusText({
+    enabled,
+    goals,
+    dailyRuns,
+    dailyLimit: agentDailyLimit(),
+    lastRun,
+  });
+}
+
+async function runAgentCycle(options = {}) {
+  const enabled = await isAgentEnabled();
+  const ownerChatId = await MEMORY.get("admin:chat_id") || "";
+  const goals = await getAgentGoals();
+  const day = currentAgentDay();
+  const dailyRuns = Number(await MEMORY.get(`agent:daily_runs:${day}`) || "0");
+  const recentlySearchedGoalIds = await getRecentlySearchedAgentGoalIds(goals);
+  const action = chooseAgentAction({
+    enabled,
+    ownerChatId,
+    goals,
+    dailyRuns,
+    dailyLimit: agentDailyLimit(),
+    reportDue: await isAgentDailyReportDue(),
+    recentlySearchedGoalIds,
+  });
+
+  if (action.type === "skip") {
+    if (options.manual) {
+      await saveAgentLog({
+        action: "skip",
+        status: "skipped",
+        reason: action.reason,
+        summary: agentSkipReasonText(action.reason),
+      });
+    }
+    return `Agent 本轮跳过：${agentSkipReasonText(action.reason)}`;
+  }
+
+  await MEMORY.put("agent:last_run", new Date().toISOString());
+  await incrementAgentDailyRuns(day);
+
+  if (action.type === "daily_report") {
+    const report = await buildAgentDailyReport();
+    await MEMORY.put(`agent:daily_report:${day}`, new Date().toISOString(), {
+      expirationTtl: 60 * 60 * 48,
+    });
+    await saveAgentLog({
+      action: "daily_report",
+      status: "success",
+      reason: action.reason,
+      summary: "已发送 Agent 每日报告。",
+    });
+    if (!options.manual) {
+      await sendFeishuText(ownerChatId, report);
+    }
+    return report;
+  }
+
+  if (action.type === "search_learning") {
+    const result = await learnFromSearchQuery(action.goal.text, "agent", {
+      manual: false,
+      force: false,
+    });
+    await MEMORY.put(`agent:goal:last_search:${action.goal.id}`, new Date().toISOString(), {
+      expirationTtl: 60 * 60 * 24,
+    });
+    await saveAgentLog({
+      action: "search_learning",
+      status: result.startsWith("搜索学习失败") ? "failed" : "success",
+      reason: action.reason,
+      goal: action.goal.text,
+      summary: result,
+    });
+    return options.manual
+      ? [`Agent 已运行：搜索学习`, `目标：${action.goal.text}`, "", result].join("\n")
+      : "agent search learning complete";
+  }
+
+  return "Agent 本轮没有可执行动作。";
+}
+
+async function getRecentlySearchedAgentGoalIds(goals) {
+  const result = new Set();
+
+  for (const goal of goals) {
+    const searched = await MEMORY.get(`agent:goal:last_search:${goal.id}`);
+    if (searched) result.add(goal.id);
+  }
+
+  return result;
+}
+
+async function isAgentDailyReportDue() {
+  const now = new Date();
+  if (now.getHours() < agentReportHour()) return false;
+
+  const day = currentAgentDay();
+  return !await MEMORY.get(`agent:daily_report:${day}`);
+}
+
+async function incrementAgentDailyRuns(day = currentAgentDay()) {
+  const key = `agent:daily_runs:${day}`;
+  const used = Number(await MEMORY.get(key) || "0");
+  await MEMORY.put(key, String(used + 1), {
+    expirationTtl: 60 * 60 * 48,
+  });
+}
+
+async function saveAgentLog(log) {
+  const id = `agent_log_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const full = {
+    id,
+    action: log.action || "unknown",
+    reason: log.reason || "",
+    goal: log.goal || "",
+    status: log.status || "unknown",
+    summary: String(log.summary || "").slice(0, 2000),
+    createdAt: new Date().toISOString(),
+  };
+
+  await MEMORY.put(`agent:log:${id}`, JSON.stringify(full), {
+    expirationTtl: 60 * 60 * 24 * 60,
+  });
+
+  const index = await getJson("agent:logs:index", []);
+  index.unshift({
+    id,
+    action: full.action,
+    status: full.status,
+    reason: full.reason,
+    goal: full.goal,
+    createdAt: full.createdAt,
+  });
+  await MEMORY.put("agent:logs:index", JSON.stringify(index.slice(0, 80)));
+}
+
+async function listAgentLogs() {
+  const index = await getJson("agent:logs:index", []);
+  const logs = [];
+
+  for (const item of index.slice(0, 10)) {
+    const full = await getJson(`agent:log:${item.id}`, item);
+    logs.push(full);
+  }
+
+  return formatAgentLogs(logs);
+}
+
+async function buildAgentDailyReport() {
+  const logsText = await listAgentLogs();
+  const notesText = await listLearningNotes();
+  const fallback = [
+    "小龙虾 Agent 每日报告",
+    "",
+    logsText,
+    "",
+    notesText,
+  ].join("\n").slice(0, 6000);
+
+  try {
+    return await callDeepSeek([
+      {
+        role: "system",
+        content: "你是小龙虾 Agent 的日报模块。请根据工作日志和学习笔记，给主人输出简短、具体、可行动的日报。不要编造没有出现的结果。",
+      },
+      {
+        role: "user",
+        content: `Agent 工作日志：\n${logsText}\n\n学习笔记：\n${notesText}\n\n请输出：\n1. 今天自主做了什么\n2. 学到了什么\n3. 沉淀了什么\n4. 明天建议继续做什么`,
+      },
+    ], {
+      thinking: "disabled",
+      maxTokens: 1400,
+    });
+  } catch (error) {
+    console.error("buildAgentDailyReport error:", error);
+    return fallback;
+  }
+}
+
+function agentSkipReasonText(reason) {
+  const map = {
+    agent_disabled: "Agent 模式未开启。发送 /开启Agent 可开启。",
+    missing_owner_chat: "还没有绑定主人会话。发送 /绑定主人 或 /开启Agent 可绑定当前会话。",
+    daily_quota_exhausted: "今日自主运行额度已用完。",
+    no_goal_ready: "当前目标今天都已处理过，暂不重复搜索。",
+  };
+
+  return map[reason] || reason || "未知原因";
+}
+
+function currentAgentDay() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 async function summarizePage(url, pageText) {
@@ -1896,6 +2217,24 @@ function helpText() {
 
 /关闭自动学习
 停止自动读取群聊学习
+
+/开启Agent
+开启自主 Agent 模式，按目标池定时学习和汇报
+
+/关闭Agent
+关闭自主 Agent 模式
+
+/Agent状态
+查看 Agent 是否开启、目标和今日运行额度
+
+/Agent目标 目标1；目标2
+设置 Agent 自主工作目标
+
+/Agent日志
+查看最近自主工作记录
+
+/Agent运行
+手动触发一次 Agent 自主循环
 
 正常聊天时，我会自动判断是否需要联网搜索，并调用长期偏好和 Skill。`;
 }

@@ -39,6 +39,11 @@ AUTO_WEB_LEARNING_MAX_URLS=2
 AUTO_SEARCH_LEARNING_DAILY_LIMIT=5
 GROUP_LEARNING_INTERVAL_MS=3600000
 GROUP_LEARNING_LOOKBACK_HOURS=24
+ENABLE_AGENT_MODE=false
+AGENT_INTERVAL_MS=3600000
+AGENT_DAILY_RUN_LIMIT=3
+AGENT_REPORT_HOUR=21
+AGENT_DEFAULT_GOALS=持续学习用户关注的主题;自动沉淀可复用 Skill;每天总结自主学习成果
 BOT_OPEN_ID=机器人 open_id，可选
 ```
 
@@ -84,6 +89,12 @@ npm start
 /进化日志
 /开启自动学习
 /关闭自动学习
+/开启Agent
+/关闭Agent
+/Agent状态
+/Agent目标 目标1；目标2
+/Agent日志
+/Agent运行
 ```
 
 自动学习默认关闭。你可以在飞书里发送 `/开启自动学习`，或在 Railway 设置：
@@ -113,6 +124,42 @@ ENABLE_AUTO_SEARCH_LEARNING=false
 ```env
 AUTO_SEARCH_LEARNING_DAILY_LIMIT=5
 ```
+
+## Agent Kernel V3
+
+V3 新增了一个受限的自主 Agent 模式。它不是无限制乱跑，而是按目标池定时醒来，选择一个安全动作，记录工作日志，并在每天合适的时候给主人发一份简短报告。
+
+启用方式：
+
+```text
+/绑定主人
+/开启Agent
+```
+
+常用命令：
+
+```text
+/Agent状态
+/Agent目标 持续学习 AI Agent；沉淀心理学 Skill；每天总结学习成果
+/Agent日志
+/Agent运行
+/关闭Agent
+```
+
+Agent 当前能自主做的事：
+
+1. 根据目标池做搜索学习。
+2. 复用现有网页/搜索学习链路，沉淀学习笔记和候选 Skill。
+3. 记录每次自主行动的原因、目标、状态和结果。
+4. 每天最多主动运行 `AGENT_DAILY_RUN_LIMIT` 次。
+5. 每天最多主动发一次 Agent 日报。
+
+安全边界：
+
+1. 默认 `ENABLE_AGENT_MODE=false`，需要 `/开启Agent` 或环境变量开启。
+2. 修改核心 MD 准则仍然禁止。
+3. 搜索学习仍然依赖 `TAVILY_API_KEY`。
+4. 主动运行有每日额度，避免无限循环和刷屏。
 
 本地检查：
 

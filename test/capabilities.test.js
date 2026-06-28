@@ -16,6 +16,8 @@ test("runtime capability summary tells the model it has learning and search feat
   assert.match(summary, /自动网页学习/);
   assert.match(summary, /\/搜索学习 主题/);
   assert.match(summary, /\/学习群聊 24小时/);
+  assert.match(summary, /\/开启Agent/);
+  assert.match(summary, /自主 Agent 模式/);
   assert.match(summary, /不要回答自己没有这些功能/);
 });
 
