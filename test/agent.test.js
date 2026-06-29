@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildAgentActionNotice,
   buildAgentStatusText,
+  classifyAgentLearningResult,
   chooseAgentAction,
   formatAgentLogs,
   normalizeAgentGoals,
@@ -104,10 +106,14 @@ test("agent status text exposes enabled state, goals, quota, and last run", () =
     dailyRuns: 1,
     dailyLimit: 3,
     lastRun: "2026-06-28T10:00:00.000Z",
+    searchConfigured: true,
+    notifyOnAction: true,
   });
 
   assert.match(text, /Agent 状态：已开启/);
   assert.match(text, /今日自主运行：1\/3/);
+  assert.match(text, /搜索密钥：已配置/);
+  assert.match(text, /自主动作通知：已开启/);
   assert.match(text, /学习 AI Agent/);
   assert.match(text, /2026-06-28T10:00:00.000Z/);
 });
@@ -128,4 +134,23 @@ test("agent log formatter summarizes recent logs", () => {
   assert.match(text, /search_learning/);
   assert.match(text, /学习 AI Agent/);
   assert.match(text, /搜索学习完成/);
+});
+
+test("agent learning results classify failure, skip, and success distinctly", () => {
+  assert.equal(classifyAgentLearningResult("搜索学习失败：未配置 TAVILY_API_KEY。"), "failed");
+  assert.equal(classifyAgentLearningResult("这个主题近期已搜索学习过，跳过重复学习。"), "skipped");
+  assert.equal(classifyAgentLearningResult("搜索学习完成。\n新增学习笔记：1 条"), "success");
+});
+
+test("agent action notice makes autonomous learning visible to the owner", () => {
+  const notice = buildAgentActionNotice({
+    action: "search_learning",
+    status: "success",
+    goal: "学习 AI Agent",
+    summary: "搜索学习完成。\n新增学习笔记：1 条",
+  });
+
+  assert.match(notice, /Agent 自主学习完成/);
+  assert.match(notice, /学习 AI Agent/);
+  assert.match(notice, /新增学习笔记：1 条/);
 });

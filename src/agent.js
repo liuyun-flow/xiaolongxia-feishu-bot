@@ -74,6 +74,8 @@ export function buildAgentStatusText(state = {}) {
     `Agent 状态：${enabled}`,
     `今日自主运行：${dailyRuns}/${dailyLimit}`,
     `上次运行：${state.lastRun || "暂无"}`,
+    `搜索密钥：${state.searchConfigured ? "已配置" : "未配置"}`,
+    `自主动作通知：${state.notifyOnAction ? "已开启" : "已关闭"}`,
     "",
     "当前目标：",
     ...goalRows,
@@ -91,4 +93,28 @@ export function formatAgentLogs(logs = []) {
   }
 
   return ["最近 Agent 工作日志：", "", ...rows].join("\n\n").slice(0, 6000);
+}
+
+export function classifyAgentLearningResult(result) {
+  const text = String(result || "");
+  if (text.startsWith("搜索学习失败")) return "failed";
+  if (/跳过|已搜索学习过|额度已用完/.test(text)) return "skipped";
+  return "success";
+}
+
+export function buildAgentActionNotice(log = {}) {
+  if (log.action !== "search_learning") return "";
+
+  const title = log.status === "success"
+    ? "Agent 自主学习完成"
+    : log.status === "failed"
+      ? "Agent 自主学习失败"
+      : "Agent 自主学习跳过";
+
+  return [
+    title,
+    "",
+    log.goal ? `目标：${log.goal}` : "",
+    log.summary ? `结果：${String(log.summary).slice(0, 1200)}` : "",
+  ].filter(Boolean).join("\n");
 }

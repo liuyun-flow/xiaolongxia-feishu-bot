@@ -5,7 +5,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import {
+  buildAgentActionNotice,
   buildAgentStatusText,
+  classifyAgentLearningResult,
   chooseAgentAction,
   formatAgentLogs,
   normalizeAgentGoals,
@@ -69,6 +71,7 @@ const {
   AGENT_DAILY_RUN_LIMIT = "3",
   AGENT_REPORT_HOUR = "21",
   AGENT_DEFAULT_GOALS = "持续学习用户关注的主题;自动沉淀可复用 Skill;每天总结自主学习成果",
+  AGENT_NOTIFY_ON_ACTION = "true",
   BOT_OPEN_ID = "",
 } = process.env;
 
@@ -86,6 +89,7 @@ console.log("ENABLE_AUTO_GROUP_LEARNING：", ENABLE_AUTO_GROUP_LEARNING);
 console.log("ENABLE_AUTO_WEB_LEARNING：", ENABLE_AUTO_WEB_LEARNING);
 console.log("ENABLE_AUTO_SEARCH_LEARNING：", ENABLE_AUTO_SEARCH_LEARNING);
 console.log("ENABLE_AGENT_MODE：", ENABLE_AGENT_MODE);
+console.log("AGENT_NOTIFY_ON_ACTION：", AGENT_NOTIFY_ON_ACTION);
 
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
   console.error("启动失败：缺少 FEISHU_APP_ID 或 FEISHU_APP_SECRET");
@@ -329,6 +333,12 @@ if (agentInterval > 0) {
     });
   }, agentInterval);
 
+  setTimeout(() => {
+    runAgentCycle({ manual: false, reason: "startup" }).catch((error) => {
+      console.error("Initial startup agent cycle failed:", error);
+    });
+  }, 10 * 1000).unref?.();
+
   console.log(`Agent 自主循环检查已启用，间隔 ${agentInterval}ms`);
 }
 
@@ -547,6 +557,9 @@ async function handleFeishuMessage(data) {
       await MEMORY.put("agent:enabled", "true");
       await MEMORY.put("admin:chat_id", chatId);
       await sendFeishuText(chatId, "已开启 Agent 模式。我会按目标池自主学习、记录工作日志，并在合适时机汇报。");
+      runAgentCycle({ manual: false, reason: "enabled_by_command" }).catch((error) => {
+        console.error("Initial agent cycle failed:", error);
+      });
       return;
     }
 
@@ -1093,6 +1106,10 @@ async function isAgentEnabled() {
   return shouldEnableAgent(ENABLE_AGENT_MODE);
 }
 
+function shouldNotifyAgentAction() {
+  return shouldEnableAgent(AGENT_NOTIFY_ON_ACTION);
+}
+
 async function getAgentGoals() {
   const stored = await getJson("agent:goals", null);
   return normalizeAgentGoals(stored || [], defaultAgentGoals());
@@ -1111,6 +1128,8 @@ async function getAgentStatusText() {
     dailyRuns,
     dailyLimit: agentDailyLimit(),
     lastRun,
+    searchConfigured: Boolean(TAVILY_API_KEY),
+    notifyOnAction: shouldNotifyAgentAction(),
   });
 }
 
@@ -1168,16 +1187,24 @@ async function runAgentCycle(options = {}) {
       manual: false,
       force: false,
     });
-    await MEMORY.put(`agent:goal:last_search:${action.goal.id}`, new Date().toISOString(), {
-      expirationTtl: 60 * 60 * 24,
-    });
-    await saveAgentLog({
+    const status = classifyAgentLearningResult(result);
+    if (status !== "failed") {
+      await MEMORY.put(`agent:goal:last_search:${action.goal.id}`, new Date().toISOString(), {
+        expirationTtl: 60 * 60 * 24,
+      });
+    }
+    const log = {
       action: "search_learning",
-      status: result.startsWith("搜索学习失败") ? "failed" : "success",
+      status,
       reason: action.reason,
       goal: action.goal.text,
       summary: result,
-    });
+    };
+    await saveAgentLog(log);
+    if (!options.manual && shouldNotifyAgentAction()) {
+      const notice = buildAgentActionNotice(log);
+      if (notice) await sendFeishuText(ownerChatId, notice);
+    }
     return options.manual
       ? [`Agent 已运行：搜索学习`, `目标：${action.goal.text}`, "", result].join("\n")
       : "agent search learning complete";

@@ -44,6 +44,7 @@ AGENT_INTERVAL_MS=3600000
 AGENT_DAILY_RUN_LIMIT=3
 AGENT_REPORT_HOUR=21
 AGENT_DEFAULT_GOALS=持续学习用户关注的主题;自动沉淀可复用 Skill;每天总结自主学习成果
+AGENT_NOTIFY_ON_ACTION=true
 BOT_OPEN_ID=机器人 open_id，可选
 ```
 
@@ -127,7 +128,7 @@ AUTO_SEARCH_LEARNING_DAILY_LIMIT=5
 
 ## Agent Kernel V3
 
-V3 新增了一个受限的自主 Agent 模式。它不是无限制乱跑，而是按目标池定时醒来，选择一个安全动作，记录工作日志，并在每天合适的时候给主人发一份简短报告。
+V3 新增了一个受限的自主 Agent 模式。它不是无限制乱跑，而是按目标池定时醒来，选择一个安全动作，记录工作日志，并在每天合适的时候给主人发一份简短报告。开启 Agent 后会立即尝试运行一次；服务启动后也会在 10 秒内做一次首次检查，不必等满 `AGENT_INTERVAL_MS`。
 
 启用方式：
 
@@ -153,6 +154,7 @@ Agent 当前能自主做的事：
 3. 记录每次自主行动的原因、目标、状态和结果。
 4. 每天最多主动运行 `AGENT_DAILY_RUN_LIMIT` 次。
 5. 每天最多主动发一次 Agent 日报。
+6. `AGENT_NOTIFY_ON_ACTION=true` 时，每次自主搜索学习完成、跳过或失败都会给主人发一条简短通知。
 
 安全边界：
 
@@ -160,6 +162,15 @@ Agent 当前能自主做的事：
 2. 修改核心 MD 准则仍然禁止。
 3. 搜索学习仍然依赖 `TAVILY_API_KEY`。
 4. 主动运行有每日额度，避免无限循环和刷屏。
+
+如果看起来没有自主学习，先发：
+
+```text
+/Agent状态
+/Agent日志
+```
+
+重点看 `搜索密钥` 是否已配置，以及日志里是否显示缺少 `TAVILY_API_KEY`、今日额度用完、或当前目标当天已经处理过。
 
 本地检查：
 

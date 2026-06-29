@@ -103,3 +103,9 @@ test("logger level never falls back to debug unless explicitly requested", () =>
   assert.equal(resolveFeishuLoggerLevel({ debug: "debug", info: "info" }, ""), "info");
   assert.equal(resolveFeishuLoggerLevel({ debug: "debug", info: "info" }, "debug"), "debug");
 });
+
+test("agent scheduler performs an initial startup check", async () => {
+  const source = await fs.readFile(new URL("../index.js", import.meta.url), "utf8");
+
+  assert.equal(source.includes('reason: "startup"'), true);
+});
